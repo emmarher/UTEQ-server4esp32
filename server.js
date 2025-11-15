@@ -116,6 +116,7 @@ app.post("/api/telemetry", async (req, res) => {
 app.get("/health", (req, res) => {
   res.json({
     status: "running",
+    version: "2.5.0-viernes-14-nov-2025",
     db: mongoose.connection.readyState === 1 ? "connected" : "disconnected",
   });
 });
