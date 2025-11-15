@@ -1,165 +1,134 @@
 /********************************************************************
- *  server.js  –  Express protegido SOLO con token (X-API-KEY)
- *  Integrado con MongoDB usando Mongoose
+ *  IoT Server + MongoDB + Multi-device + Intervalo Aleatorio
+ *  Protección por token, telemetría universal, auto-registro
  ********************************************************************/
 
-require('dotenv').config(); // Carga variables de entorno desde .env
-
-const express = require('express');
-const mongoose = require('mongoose');
+require("dotenv").config();
+const express = require("express");
+const mongoose = require("mongoose");
 const app = express();
+
 const PORT = process.env.PORT || 3000;
 
 // ---------------------------------------------------------------
-// 1. WHITELIST DE TOKENS (único método de autorización)
+// 1. TOKENS PERMITIDOS
 // ---------------------------------------------------------------
 const VALID_TOKENS = new Set([
-  'esp32-secret-1234',
-  'my-device-token-5678',
-  'otro-token-valido-9999',
-  // Añade aquí todos los tokens que quieras permitir
+  "esp32-secret-1234",
+  "my-device-token-5678",
+  "otro-token-valido-9999",
 ]);
 
 // ---------------------------------------------------------------
-// 2. MIDDLEWARE DE AUTORIZACIÓN POR TOKEN
+// 2. AUTENTICACIÓN POR TOKEN
 // ---------------------------------------------------------------
 app.use((req, res, next) => {
-  const token = req.headers['x-api-key'];
+  const token = req.headers["x-api-key"];
 
   if (!token || !VALID_TOKENS.has(token)) {
-    console.warn(
-      `${new Date().toISOString()} - ACCESO DENEGADO - Token: ${token || 'ninguno'} - IP: ${
-        req.ip
-      }`
-    );
-    return res
-      .status(403)
-      .json({ error: 'Forbidden – Token inválido o ausente' });
+    console.warn(`[DENEGADO] Token inválido: ${token || "ninguno"}`);
+    return res.status(403).json({ error: "Forbidden" });
   }
 
-  // Token válido → log y continuar
-  console.log(
-    `${new Date().toISOString()} - ${req.method} ${req.path} - Token: ${token} - IP: ${req.ip}`
-  );
-
+  req.deviceToken = token;
+  console.log(`[OK] ${req.method} ${req.path} Token=${token}`);
   next();
 });
 
 // ---------------------------------------------------------------
-// 3. Middleware para parsear JSON
+// 3. JSON
 // ---------------------------------------------------------------
 app.use(express.json());
 
 // ---------------------------------------------------------------
-// 4. Configuración de MongoDB
+// 4. MONGO MODELOS
 // ---------------------------------------------------------------
-mongoose.set('strictQuery', false);
+mongoose.set("strictQuery", false);
 
-// Esquemas y Modelos
-const sensorSchema = new mongoose.Schema({
-  data: { type: Object, required: true },
-  received_at: { type: Date, default: Date.now }
+const DeviceSchema = new mongoose.Schema({
+  device_name: { type: String, unique: true },
+  interval_seconds: { type: Number, default: 60 },
+  created_at: { type: Date, default: Date.now },
+  updated_at: { type: Date, default: Date.now },
 });
 
-const deviceSchema = new mongoose.Schema({
-  device_id: { type: Number, required: true, unique: true },
-  state: { type: Object, required: true },
-  updated_at: { type: Date, default: Date.now }
-});
+const Device = mongoose.model("Device", DeviceSchema);
 
-const Sensor = mongoose.model('Sensor', sensorSchema);
-const Device = mongoose.model('Device', deviceSchema);
-
-// Función asíncrona para conectar a MongoDB
-async function connectDB() {
-  try {
-    await mongoose.connect(process.env.MONGODB_URI);
-    console.log('Conectado a MongoDB exitosamente');
-  } catch (error) {
-    console.error('Error al conectar a MongoDB:', error);
-    process.exit(1); // Salir si falla la conexión
-  }
+// ---------------------------------------------------------------
+// 5. FUNCION PARA GENERAR INTERVALO ALEATORIO
+// ---------------------------------------------------------------
+function randomInterval() {
+  return Math.floor(Math.random() * (200 - 20 + 1)) + 20; // 20 - 200 seg
 }
 
 // ---------------------------------------------------------------
-// 5. RUTAS
+// 6. ENDPOINT → Recibir telemetría universal
 // ---------------------------------------------------------------
-app.get('/health', (req, res) => {
-  const ts = new Date().toISOString();
+app.post("/api/telemetry", async (req, res) => {
+  const { device_name, timestamp_device, telemetry } = req.body;
+
+  if (!device_name || !telemetry)
+    return res.status(400).json({ error: "device_name y telemetry requeridos" });
+
+  // Obtener o crear dispositivo
+  let device = await Device.findOne({ device_name });
+  if (!device) {
+    device = new Device({ device_name });
+    await device.save();
+    console.log(`[NEW DEVICE] ${device_name} registrado`);
+  }
+
+  // Generar un nuevo intervalo aleatorio para este dispositivo
+  const newInterval = randomInterval();
+  device.interval_seconds = newInterval;
+  device.updated_at = Date.now();
+  await device.save();
+
+  // Crear colección dinámica por dispositivo
+  const collectionName = `telemetry_${device_name}`;
+  const Telemetry = mongoose.model(
+    collectionName,
+    new mongoose.Schema({}, { strict: false }),
+    collectionName
+  );
+
+  // Guardar telemetría
+  await Telemetry.create({
+    telemetry,
+    timestamp_device,
+    timestamp_server: Date.now(),
+    ip: req.ip,
+    token: req.deviceToken,
+    interval_assigned: newInterval,
+  });
+
   res.json({
-    status: 'success',
-    received_at: ts,
-    message: 'Servidor healthy – actualización confirmada',
-    db_status: mongoose.connection.readyState === 1 ? 'Conectado' : 'Desconectado'
+    status: "success",
+    device: device_name,
+    server_time: Date.now(),
+    interval_seconds: newInterval,   // SE ENVÍA EL INTERVALO ALEATORIO
   });
 });
 
-app.post('/api/sensor', async (req, res) => {
-  const ts = new Date().toISOString();
-  console.log('Sensor data:', req.body);
-
-  try {
-    const newSensorData = new Sensor({ data: req.body });
-    await newSensorData.save();
-    res.json({
-      status: 'success',
-      received_at: ts,
-      message: 'Datos de sensor guardados en MongoDB',
-      processed_data: req.body,
-      mongo_id: newSensorData._id
-    });
-  } catch (error) {
-    console.error('Error al guardar en MongoDB:', error);
-    res.status(500).json({
-      status: 'error',
-      message: 'Error al guardar datos de sensor en la base de datos'
-    });
-  }
+// ---------------------------------------------------------------
+// 7. HEALTH
+// ---------------------------------------------------------------
+app.get("/health", (req, res) => {
+  res.json({
+    status: "running",
+    db: mongoose.connection.readyState === 1 ? "connected" : "disconnected",
+  });
 });
 
-app.put('/api/device/1', async (req, res) => {
-  const ts = new Date().toISOString();
-  console.log('Device update:', req.body);
-
-  try {
-    const updatedDevice = await Device.findOneAndUpdate(
-      { device_id: 1 },
-      { state: req.body, updated_at: new Date() },
-      { upsert: true, new: true, setDefaultsOnInsert: true }
+// ---------------------------------------------------------------
+// 8. START SERVER
+// ---------------------------------------------------------------
+mongoose
+  .connect(process.env.MONGODB_URI)
+  .then(() => {
+    console.log("MongoDB conectado");
+    app.listen(PORT, () =>
+      console.log(`Servidor IoT en puerto ${PORT}`)
     );
-    res.json({
-      status: 'success',
-      received_at: ts,
-      message: 'Estado del dispositivo actualizado en MongoDB',
-      updated: req.body,
-      mongo_id: updatedDevice._id
-    });
-  } catch (error) {
-    console.error('Error al actualizar en MongoDB:', error);
-    res.status(500).json({
-      status: 'error',
-      message: 'Error al actualizar el dispositivo en la base de datos'
-    });
-  }
-});
-
-// ---------------------------------------------------------------
-// 6. 404
-// ---------------------------------------------------------------
-app.use((req, res) => {
-  res.status(404).json({ error: 'Endpoint no encontrado' });
-});
-
-// ---------------------------------------------------------------
-// 7. INICIO DEL SERVIDOR (después de conectar a DB)
-// ---------------------------------------------------------------
-async function startServer() {
-  await connectDB();
-  app.listen(PORT, () => {
-    console.log(`Servidor Express corriendo en ${PORT}`);
-    console.log('Autorización: SOLO token en header X-API-KEY');
-    console.log('Tokens válidos:', Array.from(VALID_TOKENS));
-  });
-}
-
-startServer();
+  })
+  .catch((err) => console.error("Error en Mongo:", err));
