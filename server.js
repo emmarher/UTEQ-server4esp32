@@ -1,13 +1,12 @@
 /********************************************************************
- *  IoT Server + MongoDB + Multi-device + Intervalo Aleatorio
- *  Protección por token, telemetría universal, auto-registro
+ *  IoT Server + MongoDB + Multi-device + Intervalo Aleatorio (20-900s)
+ *  Una sola colección de telemetría → escalable y limpia
  ********************************************************************/
 
 require("dotenv").config();
 const express = require("express");
 const mongoose = require("mongoose");
 const app = express();
-
 const PORT = process.env.PORT || 3000;
 
 // ---------------------------------------------------------------
@@ -17,119 +16,160 @@ const VALID_TOKENS = new Set([
   "esp32-secret-1234",
   "my-device-token-5678",
   "otro-token-valido-9999",
+  // Agrega más cuando quieras
 ]);
 
 // ---------------------------------------------------------------
 // 2. AUTENTICACIÓN POR TOKEN
 // ---------------------------------------------------------------
 app.use((req, res, next) => {
-  const token = req.headers["x-api-key"];
+  const token = req.headers["x-api-key"]?.trim();
 
   if (!token || !VALID_TOKENS.has(token)) {
-    console.warn(`[DENEGADO] Token inválido: ${token || "ninguno"}`);
-    return res.status(403).json({ error: "Forbidden" });
+    console.warn(`[DENEGADO] Token inválido o ausente desde IP: ${req.ip}`);
+    return res.status(403).json({ error: "Forbidden – Token inválido" });
   }
 
   req.deviceToken = token;
-  console.log(`[OK] ${req.method} ${req.path} Token=${token}`);
   next();
 });
 
 // ---------------------------------------------------------------
-// 3. JSON
+// 3. Middleware JSON
 // ---------------------------------------------------------------
 app.use(express.json());
 
 // ---------------------------------------------------------------
-// 4. MONGO MODELOS
+// 4. Modelos de MongoDB
 // ---------------------------------------------------------------
 mongoose.set("strictQuery", false);
 
+// Dispositivo (uno por ESP32)
 const DeviceSchema = new mongoose.Schema({
-  device_name: { type: String, unique: true },
-  interval_seconds: { type: Number, default: 60 },
+  token: { type: String, required: true, unique: true },        // el X-API-KEY
+  device_name: { type: String, required: true, unique: true },  // nombre que envía la ESP32
+  interval_seconds: { type: Number, default: 60 },             // intervalo actual asignado
+  last_seen: { type: Date, default: Date.now },
   created_at: { type: Date, default: Date.now },
-  updated_at: { type: Date, default: Date.now },
 });
 
 const Device = mongoose.model("Device", DeviceSchema);
 
+// Telemetría (una sola colección para TODOS los dispositivos)
+const TelemetrySchema = new mongoose.Schema({
+  device: { type: mongoose.Schema.Types.ObjectId, ref: "Device", required: true },
+  device_name: String,                    // redundante pero útil para consultas rápidas
+  telemetry: { type: mongoose.Schema.Types.Mixed, required: true }, // cualquier JSON
+  timestamp_device: Date,                 // timestamp que envía la ESP32
+  timestamp_server: { type: Date, default: Date.now },
+  ip: String,
+  interval_assigned: Number,              // el intervalo que se le dijo que use
+});
+
+TelemetrySchema.index({ device: 1, timestamp_server: -1 }); // para consultas rápidas
+TelemetrySchema.index({ timestamp_server: -1 });
+
+const Telemetry = mongoose.model("Telemetry", TelemetrySchema);
+
 // ---------------------------------------------------------------
-// 5. FUNCION PARA GENERAR INTERVALO ALEATORIO
+// 5. Generar intervalo aleatorio entre 20 y 900 segundos
 // ---------------------------------------------------------------
 function randomInterval() {
-  return Math.floor(Math.random() * (200 - 20 + 1)) + 20; // 20 - 200 seg
+  return Math.floor(Math.random() * (900 - 20 + 1)) + 20; // 20 a 900 segundos
 }
 
 // ---------------------------------------------------------------
-// 6. ENDPOINT → Recibir telemetría universal
+// 6. POST /api/telemetry → recibe datos de cualquier ESP32
 // ---------------------------------------------------------------
 app.post("/api/telemetry", async (req, res) => {
   const { device_name, timestamp_device, telemetry } = req.body;
 
-  if (!device_name || !telemetry)
-    return res.status(400).json({ error: "device_name y telemetry requeridos" });
-
-  // Obtener o crear dispositivo
-  let device = await Device.findOne({ device_name });
-  if (!device) {
-    device = new Device({ device_name });
-    await device.save();
-    console.log(`[NEW DEVICE] ${device_name} registrado`);
+  if (!device_name || typeof telemetry !== "object") {
+    return res.status(400).json({
+      error: "Faltan device_name o telemetry (debe ser objeto JSON)",
+    });
   }
 
-  // Generar un nuevo intervalo aleatorio para este dispositivo
-  const newInterval = randomInterval();
-  device.interval_seconds = newInterval;
-  device.updated_at = Date.now();
-  await device.save();
+  try {
+    // Buscar o crear el dispositivo por token + device_name
+    let device = await Device.findOne({ token: req.deviceToken });
 
-  // Crear colección dinámica por dispositivo
-  const collectionName = `telemetry_${device_name}`;
-  const Telemetry = mongoose.model(
-    collectionName,
-    new mongoose.Schema({}, { strict: false }),
-    collectionName
-  );
+    if (!device) {
+      // Primer registro del dispositivo
+      device = new Device({
+        token: req.deviceToken,
+        device_name,
+        interval_seconds: randomInterval(),
+      });
+      await device.save();
+      console.log(`[NUEVO DISPOSITIVO] ${device_name} | Token: ${req.deviceToken}`);
+    } else {
+      // Actualizar nombre si cambió (por si el usuario lo modifica)
+      if (device.device_name !== device_name) {
+        device.device_name = device_name;
+      }
+    }
 
-  // Guardar telemetría
-  await Telemetry.create({
-    telemetry,
-    timestamp_device,
-    timestamp_server: Date.now(),
-    ip: req.ip,
-    token: req.deviceToken,
-    interval_assigned: newInterval,
-  });
+    // Generar NUEVO intervalo aleatorio para la próxima vez
+    const newInterval = randomInterval();
+    device.interval_seconds = newInterval;
+    device.last_seen = new Date();
+    await device.save();
 
-  res.json({
-    status: "success",
-    device: device_name,
-    server_time: Date.now(),
-    interval_seconds: newInterval,   // SE ENVÍA EL INTERVALO ALEATORIO
-  });
+    // Guardar telemetría
+    await Telemetry.create({
+      device: device._id,
+      device_name,
+      telemetry,
+      timestamp_device: timestamp_device ? new Date(timestamp_device) : null,
+      ip: req.ip,
+      interval_assigned: newInterval,
+    });
+
+    // Respuesta al ESP32
+    res.json({
+      status: "success",
+      server_time: Date.now(),
+      device_name,
+      next_report_in_seconds: newInterval,   // ← ESTE ES EL VALOR QUE LA ESP32 DEBE USAR
+      message: "Datos recibidos y guardados",
+    });
+  } catch (err) {
+    console.error("Error en /api/telemetry:", err);
+    res.status(500).json({ error: "Error interno del servidor" });
+  }
 });
 
 // ---------------------------------------------------------------
-// 7. HEALTH
+// 7. HEALTH + info rápida de dispositivos
 // ---------------------------------------------------------------
-app.get("/health", (req, res) => {
+app.get("/health", async (req, res) => {
+  const deviceCount = await Device.countDocuments();
   res.json({
     status: "running",
-    version: "2.5.0-viernes-14-nov-2025",
-    db: mongoose.connection.readyState === 1 ? "connected" : "disconnected",
+    version: "3.0.0 – Producción estable (21-nov-2025)",
+    mongodb: mongoose.connection.readyState === 1 ? "connected" : "disconnected",
+    registered_devices: deviceCount,
+    uptime: process.uptime().toFixed(0) + "s",
   });
 });
 
 // ---------------------------------------------------------------
-// 8. START SERVER
+// 8. Iniciar servidor
 // ---------------------------------------------------------------
 mongoose
-  .connect(process.env.MONGODB_URI)
-  .then(() => {
-    console.log("MongoDB conectado");
-    app.listen(PORT, () =>
-      console.log(`Servidor IoT en puerto ${PORT}`)
-    );
+  .connect(process.env.MONGODB_URI, {
+    useNewUrlParser: true,
+    useUnifiedTopology: true,
   })
-  .catch((err) => console.error("Error en Mongo:", err));
+  .then(() => {
+    console.log("MongoDB conectado correctamente");
+    app.listen(PORT, "0.0.0.0", () => {
+      console.log(`Servidor IoT escuchando en puerto ${PORT}`);
+      console.log(`Dispositivos registrados serán guardados automáticamente`);
+    });
+  })
+  .catch((err) => {
+    console.error("No se pudo conectar a MongoDB:", err);
+    process.exit(1);
+  });
