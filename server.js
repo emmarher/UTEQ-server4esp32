@@ -16,6 +16,9 @@ const VALID_TOKENS = new Set([
   "esp32-secret-1234",
   "my-device-token-5678",
   "otro-token-valido-9999",
+  "ESP32-SECRET-1234",
+  "ESP32-SECRET-5678",
+  "ESP32-SECRET-9999",
   // Agrega más cuando quieras
 ]);
 
